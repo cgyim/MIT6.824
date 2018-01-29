@@ -356,7 +356,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			switch rf.status {
 			case Follower:
 				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " Follower")
-				HeartBeatTimeout := 300 + rand.Intn(100)
+				HeartBeatTimeout := 300 + rand.Intn(300)
 				select {
 				case msg := <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
 					//todo if appendentrymsg is log append msg, then term should increment and votefor should be none
