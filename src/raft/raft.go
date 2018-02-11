@@ -482,7 +482,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				time.Sleep(100 * time.Millisecond)
 				rf.mu.Lock()
 				rf.status = Leader
-				rf.currentTerm += 1
+				//rf.currentTerm += 1
 				rf.mu.Unlock()
 				continue LOOP
 			}
