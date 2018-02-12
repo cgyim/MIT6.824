@@ -168,15 +168,18 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 	//empty for heartbeat
-	if len(args.Entries) == 1 && args.Entries[0].Term == 0 && args.Entries[0].Command.(int) == 0 {
+	if len(args.Entries) == 0  {
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		rf.status = Follower
 		rf.AppendEntryRpcChan <- *args
 		return
 	}
@@ -209,7 +212,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if rf.HasVoteForAnother == true && rf.currentTerm == args.Term {
-		fmt.Println(rf.me ,"reject vote rq from node: ", args.CandidateId)
+		//fmt.Println(rf.me ,"reject vote rq from node: ", args.CandidateId)
 		reply.VotedGranted = false
 		reply.Term = rf.currentTerm
 
@@ -219,9 +222,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VotedGranted = true
 		reply.Term = rf.currentTerm
 		rf.HasVoteForAnother = true
-		rf.currentTerm = args.Term    //should convert to follower but handle in goroutine switch
+		rf.currentTerm = args.Term    //should convert to follower
 		rf.votedFor = args.CandidateId
-		rf.RequestVoteRpcNotifier <- args.CandidateId //notify that status should change
+		rf.status = Follower
+		//rf.GetVoteNumber = 0
+		rf.RequestVoteRpcNotifier <- args.CandidateId //notify reset election timeout
 
 		return
 	}
@@ -230,12 +235,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// and candidate log at least update as rf's , granted.
 		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 			(args.LastLogIndex >= rf.LastApplied && args.LastLogTerm >= rf.Log[rf.LastApplied].Term) {
-			fmt.Println(rf.me, " vote for ", args.CandidateId)
+			//fmt.Println(rf.me, " vote for ", args.CandidateId)
 			rf.HasVoteForAnother = true
 			reply.VotedGranted = true
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateId
 			rf.currentTerm = args.Term
+			rf.status = Follower
+			//rf.GetVoteNumber = 0 //reset election timeout
 			rf.RequestVoteRpcNotifier <- args.CandidateId //notify that should status -> follower,even now it's follower.
 			return
 		} else {
@@ -348,7 +355,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//rf.Log =  *new([]LogEntries)
 	rf.Log = make([]LogEntries, 10000)
 	rf.Log[0] = LogEntries{Term: 0, Command: 0}
-	//rf.Log = append(rf.Log,LogEntries{Term: 0, Command: 0} )
 	rf.GetVoteNumber = 0
 	go func() {
 	LOOP:
@@ -358,22 +364,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " Follower")
 				HeartBeatTimeout := 300 + rand.Intn(300)
 				select {
-				case msg := <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
+				case  <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
 					//todo if appendentrymsg is log append msg, then term should increment and votefor should be none
 					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "get heartbeat from node", msg.LeaderId, "heartbeat timeout reset..")
-					rf.status = Follower
-					rf.GetVoteNumber = 0 //reset election timeout
-					rf.currentTerm = msg.Term
-					continue
+
+					continue LOOP
 				case <-rf.RequestVoteRpcNotifier: //receive candidate rpc vote request
 					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "voted for node ", voteFor, " ok, grant vote")
-					rf.status = Follower
-					rf.GetVoteNumber = 0
 					continue LOOP
 
 				case <-time.After(time.Duration(HeartBeatTimeout) * time.Millisecond): //election timeout set 500-800 ms
 					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "heartbeat timeout and no= vote rq,convert to candidate")
 					rf.status = Candidate
+					rf.mu.Lock()
 					continue LOOP
 
 				}
@@ -383,7 +386,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				mu := new(sync.Mutex)
 				rf.HasVoteForAnother = false
 				rf.currentTerm += 1
-				rf.GetVoteNumber += 1 //vote for itself
+				rf.GetVoteNumber = 1
+				rf.mu.Unlock()//vote for itself
 				electionTimeout := 300 + rand.Intn(300)
 				//count the number of votes received,or wait until get appendEntryRpc,or timeout
 			SENDALL:
@@ -434,14 +438,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.mu.Lock()
 					rf.status = Leader
 					rf.GetVoteNumber = 0
-					rf.mu.Unlock()
 					continue LOOP
 				case <-time.After(time.Duration(electionTimeout) * time.Millisecond):
 					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "as a candidate election timeout not enough vote,reelcet..")
 					rf.mu.Lock()
 					rf.GetVoteNumber = 0
 					rf.status = Candidate
-					rf.mu.Unlock()
 					continue LOOP
 				case <-rf.AppendEntryRpcChan:
 					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "receive leader heartbeat..conv to follower..")
@@ -453,10 +455,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 
 			case Leader:
-				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " Leader")
-				entryForHeartBeat := LogEntries{Term: 0, Command: 0}
-				//todo send append log rpc message to all servers,here only implement heartbeat for 2A
-				entries := []LogEntries{entryForHeartBeat}
+				rf.mu.Unlock()
+				//todo send append log rpc message to all servers,here only implement empty log entries heartbeat for 2A
+				entries := []LogEntries{}
 				for i := 0; i < len(rf.peers); i++ {
 					go func(index int) {
 						var reply AppendEntriesReply
@@ -479,11 +480,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					}(i)
 
 				}
-				time.Sleep(100 * time.Millisecond)
+			case time.Sleep(100 * time.Millisecond)
 				rf.mu.Lock()
 				rf.status = Leader
 				//rf.currentTerm += 1
-				rf.mu.Unlock()
 				continue LOOP
 			}
 		}
