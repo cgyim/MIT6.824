@@ -22,7 +22,6 @@ import "labrpc"
 import "time"
 import (
 	//"fmt"
-	"fmt"
 	"math/rand"
 )
 
@@ -68,29 +67,30 @@ type LogEntries struct {
 }
 
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	mu                     sync.Mutex          // Lock to protect shared access to this peer's state
+	peers                  []*labrpc.ClientEnd // RPC end points of all peers
+	persister              *Persister          // Object to hold this peer's persisted state
+	me                     int                 // this peer's index into peers[]
 	RequestVoteRpcNotifier chan int
 	AppendEntryRpcChan     chan AppendEntries
+	LeaderInvalid          chan struct{}
 	//todo
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	candidateId int //作为candidate iD,默认为peer index
-	Log         []LogEntries
-	CommitIndex int         //即将提交的log的index
-	LastApplied int         //已经提交到state machine的log的index
-	NextIndex   map[int]int //leader选项，存放其他server下一个加的index
-	MatchIndex  map[int]int //leader选项，存放目前已知所有server最高的index
-	GetEnoughVote          chan int
+	candidateId   int //作为candidate iD,默认为peer index
+	Log           []LogEntries
+	CommitIndex   int         //即将提交的log的index
+	LastApplied   int         //已经提交到state machine的log的index
+	NextIndex     map[int]int //leader选项，存放其他server下一个加的index
+	MatchIndex    map[int]int //leader选项，存放目前已知所有server最高的index
+	GetEnoughVote chan int
 
-	status      ServerStatus
-	votedFor    int //作为voter为谁投票init为-1
-	HasVoteForAnother      bool
-	GetVoteNumber          int
-	currentTerm int
+	status            ServerStatus
+	votedFor          int //作为voter为谁投票init为-1
+	HasVoteForAnother bool
+	GetVoteNumber     int
+	currentTerm       int
 }
 
 // return currentTerm and whether this server
@@ -176,7 +176,7 @@ func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply)
 		return
 	}
 	//empty for heartbeat
-	if len(args.Entries) == 0  {
+	if len(args.Entries) == 0 {
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		rf.status = Follower
@@ -198,7 +198,7 @@ func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply)
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-    rf.mu.Lock()
+	rf.mu.Lock()
 	defer func() {
 
 		rf.mu.Unlock()
@@ -222,7 +222,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VotedGranted = true
 		reply.Term = rf.currentTerm
 		rf.HasVoteForAnother = true
-		rf.currentTerm = args.Term    //should convert to follower
+		rf.currentTerm = args.Term //should convert to follower
 		rf.votedFor = args.CandidateId
 		rf.status = Follower
 		//rf.GetVoteNumber = 0
@@ -352,6 +352,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.RequestVoteRpcNotifier = make(chan int)
 	rf.AppendEntryRpcChan = make(chan AppendEntries)
 	rf.GetEnoughVote = make(chan int)
+	rf.LeaderInvalid = make(chan struct{})
 	//rf.Log =  *new([]LogEntries)
 	rf.Log = make([]LogEntries, 10000)
 	rf.Log[0] = LogEntries{Term: 0, Command: 0}
@@ -364,7 +365,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " Follower")
 				HeartBeatTimeout := 300 + rand.Intn(300)
 				select {
-				case  <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
+				case <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
 					//todo if appendentrymsg is log append msg, then term should increment and votefor should be none
 					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "get heartbeat from node", msg.LeaderId, "heartbeat timeout reset..")
 
@@ -383,11 +384,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case Candidate:
 
 				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " candidate")
+				once := new(sync.Once)
 				mu := new(sync.Mutex)
 				rf.HasVoteForAnother = false
 				rf.currentTerm += 1
 				rf.GetVoteNumber = 1
-				rf.mu.Unlock()//vote for itself
+				rf.mu.Unlock() //vote for itself
 				electionTimeout := 300 + rand.Intn(300)
 				//count the number of votes received,or wait until get appendEntryRpc,or timeout
 			SENDALL:
@@ -396,7 +398,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					if i == rf.me {
 						continue SENDALL
 					}
-					go func(index int) {
+					go func(index int, previousTerm int, once *sync.Once) {
 
 						var reply RequestVoteReply
 						rf.sendRequestVote(index, &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
@@ -406,12 +408,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//if reply.VotedGranted {
 						mu.Lock()
 						//fmt.Println("node :", rf.me, "term:", rf.currentTerm,  "receive vote reply result:", reply.VotedGranted)
-
+						if previousTerm < rf.currentTerm {
+							defer mu.Unlock()
+							return
+						}
 						//if rf.GetVoteNumber >  (len(rf.peers) -1) /2 && rf.status == Candidate {
-						if rf.GetVoteNumber >= 2  && rf.status == Candidate {
+						if rf.GetVoteNumber >= 2 && rf.status == Candidate {
 							//fmt.Println("node :", rf.me, " term: ", rf.currentTerm, "get enough vote", rf.GetVoteNumber, " convert to leader.")
-							rf.status = Leader
-							rf.GetEnoughVote <- 1
+							once.Do(func() {
+								rf.GetEnoughVote <- 1
+							})
 							defer mu.Unlock()
 							return
 						}
@@ -430,7 +436,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//todo case become leader,have to collect follower info
 						//}
 
-					}(i)
+					}(i, rf.currentTerm, once)
 
 				}
 				select {
@@ -439,27 +445,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.status = Leader
 					rf.GetVoteNumber = 0
 					continue LOOP
-				case <-time.After(time.Duration(electionTimeout) * time.Millisecond):
+				case <-time.After(time.Duration(electionTimeout) * time.Millisecond):  //timeout candidate => candidate
 					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "as a candidate election timeout not enough vote,reelcet..")
 					rf.mu.Lock()
-					rf.GetVoteNumber = 0
 					rf.status = Candidate
 					continue LOOP
 				case <-rf.AppendEntryRpcChan:
 					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "receive leader heartbeat..conv to follower..")
 					rf.mu.Lock()
 					rf.status = Follower
-					rf.GetVoteNumber = 0
 					rf.mu.Unlock()
 					continue LOOP
+				case <-rf.RequestVoteRpcNotifier:  //convert to follower
+					continue LOOP
+
 				}
 
 			case Leader:
 				rf.mu.Unlock()
 				//todo send append log rpc message to all servers,here only implement empty log entries heartbeat for 2A
 				entries := []LogEntries{}
+				once := new(sync.Once)
 				for i := 0; i < len(rf.peers); i++ {
-					go func(index int) {
+					go func(index int, once *sync.Once) {
 						var reply AppendEntriesReply
 						if index != rf.me {
 							rf.sendAppendEntryRpc(index, &AppendEntries{
@@ -471,20 +479,41 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								//    LeaderCommitIndex:0
 							},
 								&reply)
+							 if reply.Term > rf.currentTerm {
+							 	once.Do(func() {
+							          rf.LeaderInvalid <- struct{}{}
+								})
+							 }
+							 return
 							//fmt.Println("node :", rf.me, " term: ", rf.currentTerm, "send heartbeat to ", index)
 						} else {
 							return
 						}
 						//todo handle reply
 
-					}(i)
+					}(i,once)
 
 				}
-			case time.Sleep(100 * time.Millisecond)
-				rf.mu.Lock()
-				rf.status = Leader
-				//rf.currentTerm += 1
-				continue LOOP
+				select {
+
+                case <- rf.RequestVoteRpcNotifier:   //convert to follower
+                	 continue
+				case <- rf.AppendEntryRpcChan:     //convert to follower
+                     continue
+				case <-rf.LeaderInvalid:
+					rf.mu.Lock()
+					rf.status = Follower
+					rf.HasVoteForAnother = false
+					rf.votedFor = -1
+					rf.mu.Unlock()
+					continue LOOP
+				case <-time.After(100 * time.Millisecond):
+					rf.mu.Lock()
+					rf.status = Leader
+					//rf.currentTerm += 1
+					continue LOOP
+
+				}
 			}
 		}
 	}()
