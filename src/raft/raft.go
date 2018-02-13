@@ -101,11 +101,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
+	//rf.mu.Lock()
 	if rf.status == Leader {
 		isleader = true
 	} else {
 		isleader = false
 	}
+	//rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -168,8 +170,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -517,7 +519,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	return rf
