@@ -51,8 +51,7 @@ type AppendEntries struct {
 }
 
 const (
-	_ ServerStatus = iota
-	Leader
+	Leader = iota
 	Follower
 	Candidate
 )
@@ -67,30 +66,33 @@ type LogEntries struct {
 }
 
 type Raft struct {
-	mu                     sync.Mutex          // Lock to protect shared access to this peer's state
-	peers                  []*labrpc.ClientEnd // RPC end points of all peers
-	persister              *Persister          // Object to hold this peer's persisted state
-	me                     int                 // this peer's index into peers[]
-	RequestVoteRpcNotifier chan int
-	AppendEntryRpcChan     chan AppendEntries
-	LeaderInvalid          chan struct{}
+	mu              sync.Mutex          // Lock to protect shared access to this peer's state
+	peers           []*labrpc.ClientEnd // RPC end points of all peers
+	persister       *Persister          // Object to hold this peer's persisted state
+	me              int                 // this peer's index into peers[]
+	winElectionChan chan struct{}       //notify win election for candidate
+	VoteGrantChan   chan struct{}       // notify get vote for a server
+
+	AppendEntryRpcChan chan struct{} //heartbeat
+
+	//LeaderInvalid          chan struct{}
+	//CandidateInvalid       chan struct{}
+	currentTerm int
 	//todo
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	candidateId   int //作为candidate iD,默认为peer index
-	Log           []LogEntries
-	CommitIndex   int         //即将提交的log的index
-	LastApplied   int         //已经提交到state machine的log的index
-	NextIndex     map[int]int //leader选项，存放其他server下一个加的index
-	MatchIndex    map[int]int //leader选项，存放目前已知所有server最高的index
-	GetEnoughVote chan int
+	candidateId int //作为candidate iD,默认为peer index
+	Log         []LogEntries
+	CommitIndex int   //即将提交的log的index
+	LastApplied int   //已经提交到state machine的log的index
+	NextIndex   []int //leader选项，存放其他server下一个加的index
+	MatchIndex  []int //leader选项，存放目前已知所有server最高的index
 
-	status            ServerStatus
-	votedFor          int //作为voter为谁投票init为-1
-	HasVoteForAnother bool
-	GetVoteNumber     int
-	currentTerm       int
+	status        ServerStatus
+	votedFor      int // vote for which server, init as -1, change to -1 when get newer term rpc rq.
+	GetVoteNumber int // how many votes that a candidate gets in an election.
+
 }
 
 // return currentTerm and whether this server
@@ -100,9 +102,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	term = rf.currentTerm
-	//rf.mu.Lock()
-	if rf.status == Leader {
+	rf.mu.Lock()
+	term, s := rf.currentTerm, rf.status
+	rf.mu.Unlock()
+	if s == Leader {
 		isleader = true
 	} else {
 		isleader = false
@@ -169,91 +172,46 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply) {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return
-	}
-	//empty for heartbeat
-	if len(args.Entries) == 0 {
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		rf.status = Follower
-		rf.AppendEntryRpcChan <- *args
-		return
-	}
-	//todo 这里已经考虑到appendRpc log append,非heartbeat的情况，实现2A只需要leader发送{0,0},client一定会返回成功
-	// todo entries={0,0}则为heartbeat,否则需要判断log entry性质，2A不需要这判断
-	if args.Entries[args.PrevLogIndex].Term != args.PrevLogTerm || len(args.Entries) < args.PrevLogIndex {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return
-	}
-	//todo if not heartbeat but append log entries.
-
-}
-
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	defer func() {
-
-		rf.mu.Unlock()
-
-	}()
+	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
 	if rf.currentTerm > args.Term {
 		reply.VotedGranted = false
 		reply.Term = rf.currentTerm
-
 		return
 	}
-	if rf.HasVoteForAnother == true && rf.currentTerm == args.Term {
-		//fmt.Println(rf.me ,"reject vote rq from node: ", args.CandidateId)
-		reply.VotedGranted = false
-		reply.Term = rf.currentTerm
-
-		return
-	}
+	//if rf.HasVoteForAnother == true && rf.currentTerm == args.Term {
+	//	//fmt.Println(rf.me ,"reject vote rq from node: ", args.CandidateId)
+	//	reply.VotedGranted = false
+	//	reply.Term = rf.currentTerm
+	//	rf.mu.Unlock()
+	//	return
+	//}
 	if rf.currentTerm < args.Term {
-		reply.VotedGranted = true
-		reply.Term = rf.currentTerm
-		rf.HasVoteForAnother = true
-		rf.currentTerm = args.Term //should convert to follower
-		rf.votedFor = args.CandidateId
 		rf.status = Follower
-		//rf.GetVoteNumber = 0
-		rf.RequestVoteRpcNotifier <- args.CandidateId //notify reset election timeout
+		rf.currentTerm = args.Term //should convert to follower
+		rf.votedFor = -1
 
+	}
+	reply.VotedGranted = false
+	reply.Term = rf.currentTerm
+
+
+	//if voted for is null or voted for is just the candidate,
+	// and candidate log at least update as rf's , granted.
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+		(args.LastLogIndex >= len(rf.Log)-1 && args.LastLogTerm >= rf.Log[len(rf.Log)-1].Term) {
+		//fmt.Println(rf.me, " vote for ", args.CandidateId)
+		reply.VotedGranted = true
+		rf.votedFor = args.CandidateId
+		rf.VoteGrantChan <- struct{}{} //notify that should status -> follower,even now it's follower.
 		return
 	}
-	if rf.currentTerm == args.Term && rf.HasVoteForAnother == false {
-		//if voted for is null or voted for is just the candidate,
-		// and candidate log at least update as rf's , granted.
-		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-			(args.LastLogIndex >= rf.LastApplied && args.LastLogTerm >= rf.Log[rf.LastApplied].Term) {
-			//fmt.Println(rf.me, " vote for ", args.CandidateId)
-			rf.HasVoteForAnother = true
-			reply.VotedGranted = true
-			reply.Term = rf.currentTerm
-			rf.votedFor = args.CandidateId
-			rf.currentTerm = args.Term
-			rf.status = Follower
-			//rf.GetVoteNumber = 0 //reset election timeout
-			rf.RequestVoteRpcNotifier <- args.CandidateId //notify that should status -> follower,even now it's follower.
-			return
-		} else {
-			reply.VotedGranted = false
-			reply.Term = rf.currentTerm
-
-			return
-		}
-	}
+	//todo log append
 }
 
 //
@@ -287,12 +245,94 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.status != Candidate || args.Term != rf.currentTerm {
+		//because candidate may find newer term and will immediately convert to follower.
+		// and because when this requests return , candidate may not in the term when send request.
+		return ok
+	}
+	if reply.Term > rf.currentTerm {
+		//invalid candidate
+		rf.currentTerm = reply.Term
+		rf.status = Follower
+		rf.votedFor = -1
+		return ok
+	}
+	if reply.VotedGranted {
+		rf.GetVoteNumber++
+		if rf.GetVoteNumber > len(rf.peers)/2 {
+			rf.status = Leader
+			rf.winElectionChan <- struct{}{}
+		}
+	}
+
 	return ok
+}
+
+func (rf *Raft) SendAllVoteRequests() {
+
+	rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+
+
+	for i := range rf.peers {
+		if i != rf.me && rf.status == Candidate { //有可能race condition
+			rq := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
+				LastLogIndex: rf.LastApplied, LastLogTerm: rf.Log[rf.LastApplied].Term}
+			go rf.sendRequestVote(i, &rq, &RequestVoteReply{})
+		}
+	}
+
+}
+
+func (rf *Raft) AppendEntriesRpc(args *AppendEntries, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.votedFor = -1
+		rf.status = Follower
+		rf.currentTerm = args.Term
+
+	}
+	//empty for heartbeat
+	reply.Term = rf.currentTerm
+	rf.AppendEntryRpcChan <- struct{}{}
+	reply.Success = true
+    return
+	//todo 这里已经考虑到appendRpc log append,非heartbeat的情况,appendlog 需要修改
+	//if args.Entries[args.PrevLogIndex].Term != args.PrevLogTerm || len(args.Entries) < args.PrevLogIndex {
+	//	reply.Success = false
+	//	reply.Term = rf.currentTerm
+	//	return
+	//}
+	//todo if not heartbeat but append log entries.
+
 }
 
 func (rf *Raft) sendAppendEntryRpc(server int, args *AppendEntries, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntriesRpc", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if !ok || rf.status != Leader || args.Term != rf.currentTerm {
+		return ok
+	}
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.status = Follower
+		rf.votedFor = -1
+		return ok
+	}
 	return ok
+	//todo log conflict
 }
 
 //
@@ -308,6 +348,27 @@ func (rf *Raft) sendAppendEntryRpc(server int, args *AppendEntries, reply *Appen
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+
+func (rf *Raft) SendAllAppendRpc() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := range rf.peers {
+		if i != rf.me && rf.status == Leader {
+			appendEntry := AppendEntries{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				//	PrevLogIndex: 0,
+				//	PrevLogTerm : 0,
+				Entries: []LogEntries{},
+				//    LeaderCommitIndex:0
+			}
+			go rf.sendAppendEntryRpc(i, &appendEntry, &AppendEntriesReply{})
+		}
+	}
+
+}
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -345,177 +406,68 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.candidateId = me
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1 //does not vote for anyone else
 	rf.status = Follower
-	rf.HasVoteForAnother = false
 	rf.LastApplied = 0
-	rf.RequestVoteRpcNotifier = make(chan int)
-	rf.AppendEntryRpcChan = make(chan AppendEntries)
-	rf.GetEnoughVote = make(chan int)
-	rf.LeaderInvalid = make(chan struct{})
-	//rf.Log =  *new([]LogEntries)
-	rf.Log = make([]LogEntries, 10000)
-	rf.Log[0] = LogEntries{Term: 0, Command: 0}
 	rf.GetVoteNumber = 0
+	rf.currentTerm = 0
+	rf.CommitIndex = 0
+	rf.Log = append(rf.Log, LogEntries{Term: 0})
+	rf.winElectionChan = make(chan struct{}) //notify win election for candidate
+	rf.VoteGrantChan = make(chan struct{})   // notify get vote for a server
+	rf.AppendEntryRpcChan = make(chan struct{})
+
 	go func() {
-	LOOP:
 		for {
 			switch rf.status {
 			case Follower:
-				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " Follower")
-				HeartBeatTimeout := 300 + rand.Intn(300)
 				select {
 				case <-rf.AppendEntryRpcChan: //follower appendEntry msg should be empty as heartbeat
-					//todo if appendentrymsg is log append msg, then term should increment and votefor should be none
-					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "get heartbeat from node", msg.LeaderId, "heartbeat timeout reset..")
 
-					continue LOOP
-				case <-rf.RequestVoteRpcNotifier: //receive candidate rpc vote request
-					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "voted for node ", voteFor, " ok, grant vote")
-					continue LOOP
+				case <-rf.VoteGrantChan: //receive candidate rpc vote request
 
-				case <-time.After(time.Duration(HeartBeatTimeout) * time.Millisecond): //election timeout set 500-800 ms
+				case <-time.After(time.Duration(300+rand.Intn(100)) * time.Millisecond): //election timeout set 500-800 ms
 					//fmt.Println("node ", rf.me, " term :", rf.currentTerm, "heartbeat timeout and no= vote rq,convert to candidate")
-					rf.status = Candidate
 					rf.mu.Lock()
-					continue LOOP
+					rf.status = Candidate
+					rf.mu.Unlock()
+					continue
+
+
 
 				}
 			case Candidate:
-
-				//fmt.Println("node:", rf.me, " term :", rf.currentTerm, " candidate")
-				once := new(sync.Once)
-				mu := new(sync.Mutex)
-				rf.HasVoteForAnother = false
-				rf.currentTerm += 1
+				//once := new(sync.Once)
+				//mu := new(sync.Mutex)
+                rf.mu.Lock()
+				rf.votedFor = rf.me
+				rf.currentTerm++
 				rf.GetVoteNumber = 1
-				rf.mu.Unlock() //vote for itself
-				electionTimeout := 300 + rand.Intn(300)
+				rf.mu.Unlock()
+				rf.SendAllVoteRequests()
 				//count the number of votes received,or wait until get appendEntryRpc,or timeout
-			SENDALL:
-				for i := 0; i < len(peers); i++ {
 
-					if i == rf.me {
-						continue SENDALL
-					}
-					go func(index int, previousTerm int, once *sync.Once) {
-
-						var reply RequestVoteReply
-						rf.sendRequestVote(index, &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
-							LastLogIndex: rf.LastApplied, LastLogTerm: rf.Log[rf.LastApplied].Term},
-							&reply)
-						//fmt.Println(time.Now(), ", node :",rf.me, "term :",rf.currentTerm, "has sent vote rq to node:",index)
-						//if reply.VotedGranted {
-						mu.Lock()
-						//fmt.Println("node :", rf.me, "term:", rf.currentTerm,  "receive vote reply result:", reply.VotedGranted)
-						if previousTerm < rf.currentTerm {
-							defer mu.Unlock()
-							return
-						}
-						//if rf.GetVoteNumber >  (len(rf.peers) -1) /2 && rf.status == Candidate {
-						if rf.GetVoteNumber >= 2 && rf.status == Candidate {
-							//fmt.Println("node :", rf.me, " term: ", rf.currentTerm, "get enough vote", rf.GetVoteNumber, " convert to leader.")
-							once.Do(func() {
-								rf.GetEnoughVote <- 1
-							})
-							defer mu.Unlock()
-							return
-						}
-						if rf.GetVoteNumber >= 2 {
-							defer mu.Unlock()
-							return
-						}
-						if reply.VotedGranted {
-							rf.GetVoteNumber += 1
-							//fmt.Println("node :", rf.me, " term: ", rf.currentTerm, "receive vote from node ", index)
-							defer mu.Unlock()
-							return
-						}
-
-						mu.Unlock()
-						//todo case become leader,have to collect follower info
-						//}
-
-					}(i, rf.currentTerm, once)
-
-				}
 				select {
-				case <-rf.GetEnoughVote:
+				case <-rf.winElectionChan:
 					rf.mu.Lock()
 					rf.status = Leader
-					rf.GetVoteNumber = 0
-					continue LOOP
-				case <-time.After(time.Duration(electionTimeout) * time.Millisecond):  //timeout candidate => candidate
-					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "as a candidate election timeout not enough vote,reelcet..")
-					rf.mu.Lock()
-					rf.status = Candidate
-					continue LOOP
-				case <-rf.AppendEntryRpcChan:
-					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "receive leader heartbeat..conv to follower..")
-					rf.mu.Lock()
-					rf.status = Follower
 					rf.mu.Unlock()
-					continue LOOP
-				case <-rf.RequestVoteRpcNotifier:  //convert to follower
-					continue LOOP
-
+				case <-time.After(time.Duration(300+rand.Intn(100)) * time.Millisecond): //timeout candidate => candidate
+					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "as a candidate election timeout not enough vote,reelcet..")
+                      continue
+				case <-rf.AppendEntryRpcChan:
+					//rf.mu.Lock()
+					rf.status = Follower
+					//rf.mu.Unlock()
+					//fmt.Println("node: ", rf.me, " term :", rf.currentTerm, "receive leader heartbeat..conv to follower..")
 				}
 
 			case Leader:
-				rf.mu.Unlock()
+
 				//todo send append log rpc message to all servers,here only implement empty log entries heartbeat for 2A
-				entries := []LogEntries{}
-				once := new(sync.Once)
-				for i := 0; i < len(rf.peers); i++ {
-					go func(index int, once *sync.Once) {
-						var reply AppendEntriesReply
-						if index != rf.me {
-							rf.sendAppendEntryRpc(index, &AppendEntries{
-								Term:     rf.currentTerm,
-								LeaderId: rf.me,
-								//	PrevLogIndex: 0,
-								//	PrevLogTerm : 0,
-								Entries: entries,
-								//    LeaderCommitIndex:0
-							},
-								&reply)
-							 if reply.Term > rf.currentTerm {
-							 	once.Do(func() {
-							          rf.LeaderInvalid <- struct{}{}
-								})
-							 }
-							 return
-							//fmt.Println("node :", rf.me, " term: ", rf.currentTerm, "send heartbeat to ", index)
-						} else {
-							return
-						}
-						//todo handle reply
-
-					}(i,once)
-
-				}
-				select {
-
-                case <- rf.RequestVoteRpcNotifier:   //convert to follower
-                	 continue
-				case <- rf.AppendEntryRpcChan:     //convert to follower
-                     continue
-				case <-rf.LeaderInvalid:
-					rf.mu.Lock()
-					rf.status = Follower
-					rf.HasVoteForAnother = false
-					rf.votedFor = -1
-					rf.mu.Unlock()
-					continue LOOP
-				case <-time.After(100 * time.Millisecond):
-					rf.mu.Lock()
-					rf.status = Leader
-					//rf.currentTerm += 1
-					continue LOOP
-
-				}
+                rf.SendAllAppendRpc()
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()

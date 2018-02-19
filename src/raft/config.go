@@ -209,7 +209,7 @@ func (cfg *config) connect(i int) {
 	// fmt.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
-
+    //fmt.Println("c1")
 	// outgoing ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
@@ -217,7 +217,7 @@ func (cfg *config) connect(i int) {
 			cfg.net.Enable(endname, true)
 		}
 	}
-
+    //fmt.Println("c2")
 	// incoming ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
@@ -225,6 +225,7 @@ func (cfg *config) connect(i int) {
 			cfg.net.Enable(endname, true)
 		}
 	}
+	//fmt.Println("c3")
 }
 
 // detach server i from the net.
@@ -266,12 +267,14 @@ func (cfg *config) setlongreordering(longrel bool) {
 // try a few times in case re-elections are needed.
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
+		//fmt.Println("checkone :", iters)
 		time.Sleep(500 * time.Millisecond)
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
 				if t, leader := cfg.rafts[i].GetState(); leader {
 					leaders[t] = append(leaders[t], i)
+					//fmt.Println("get state iters", iters, "leader:", leaders[t])
 				}
 			}
 		}
